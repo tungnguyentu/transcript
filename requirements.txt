@@ -1,4 +1,4 @@
-openai-whisper>=20231117
+faster-whisper>=1.0
 torch>=2.1
 
 # Optional but recommended
@@ -6,3 +6,5 @@ python-dotenv>=1.0
 fastapi>=0.110
 uvicorn>=0.24
 python-multipart>=0.0.6
+celery>=5.3
+redis>=5.0

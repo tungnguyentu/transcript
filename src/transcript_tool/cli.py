@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import pathlib
 import sys
-from typing import Any, Callable, Iterable, Optional
+from typing import Callable, Optional
 
 import torch
-import whisper
+
+from .engine import resolve_compute_type, transcribe_with_cache
+from .utils import format_timestamp, segments_to_srt
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -63,6 +65,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Show word-level timestamps and diagnostics while transcribing",
     )
     parser.add_argument(
+        "--segment-length",
+        type=int,
+        default=60,
+        help="Audio segment length in seconds for preprocessing (default: 60)",
+    )
+    parser.add_argument(
         "--no-subtitle",
         action="store_true",
         help="Skip writing an .srt subtitle file",
@@ -81,40 +89,6 @@ def resolve_device(device_flag: Optional[str]) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def format_timestamp(seconds: float) -> str:
-    """Convert seconds to SRT timestamp (HH:MM:SS,mmm)."""
-
-    milliseconds_total = int(round(seconds * 1000))
-    hours, remainder = divmod(milliseconds_total, 3_600_000)
-    minutes, remainder = divmod(remainder, 60_000)
-    seconds_whole, milliseconds = divmod(remainder, 1000)
-    return f"{hours:02}:{minutes:02}:{seconds_whole:02},{milliseconds:03}"
-
-
-def segments_to_srt(segments: Iterable[dict[str, Any]]) -> str:
-    """Convert Whisper segments to SRT formatted subtitle content."""
-
-    lines: list[str] = []
-    for index, segment in enumerate(segments, start=1):
-        text = str(segment.get("text", "")).strip()
-        if not text:
-            continue
-
-        start = format_timestamp(float(segment.get("start", 0.0)))
-        end = format_timestamp(float(segment.get("end", 0.0)))
-
-        lines.append(str(index))
-        lines.append(f"{start} --> {end}")
-        lines.append(text)
-        lines.append("")
-
-    if not lines:
-        return ""
-
-    # Ensure file ends with a newline to satisfy most players.
-    return "\n".join(lines).strip() + "\n"
-
-
 def transcribe_media(
     input_path: pathlib.Path,
     *,
@@ -127,7 +101,9 @@ def transcribe_media(
     verbose: bool = False,
     write_subtitle: bool = True,
     subtitle_output_path: Optional[pathlib.Path] = None,
-    model_loader: Callable[[str, str], Any] = whisper.load_model,
+    segment_length: int = 60,
+    progress_callback: Optional[Callable[[float], None]] = None,
+    pause_check: Optional[Callable[[], None]] = None,
 ) -> tuple[pathlib.Path, Optional[pathlib.Path]]:
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -138,34 +114,26 @@ def transcribe_media(
         raise ValueError("Cannot provide subtitle_output_path when subtitles are disabled")
 
     resolved_device = resolve_device(device)
-    model_instance = model_loader(model, device=resolved_device)
-
-    task = "transcribe" if keep_source_language else "translate"
-
-    result = model_instance.transcribe(
-        str(input_path),
-        temperature=temperature,
-        beam_size=beam_size,
-        verbose=verbose,
-        task=task,
-    )
-
-    transcript_text = result.get("text", "").strip()
-    if not transcript_text:
-        raise RuntimeError("Whisper returned an empty transcript")
-
-    transcript_path.write_text(transcript_text, encoding="utf-8")
+    compute_type = resolve_compute_type(resolved_device)
 
     subtitle_path: Optional[pathlib.Path] = None
     if write_subtitle:
         subtitle_path = subtitle_output_path or input_path.with_suffix(".srt")
-        segments = result.get("segments", [])
-        subtitle_content = segments_to_srt(segments)
-        if not subtitle_content:
-            raise RuntimeError("Whisper returned no segments for subtitle generation")
-        subtitle_path.write_text(subtitle_content, encoding="utf-8")
 
-    return transcript_path, subtitle_path
+    return transcribe_with_cache(
+        input_path,
+        model_name=model,
+        device=resolved_device,
+        compute_type=compute_type,
+        task="transcribe" if keep_source_language else "translate",
+        beam_size=beam_size,
+        temperature=temperature,
+        segment_length=segment_length,
+        output_path=transcript_path,
+        subtitle_path=subtitle_path,
+        progress_callback=progress_callback,
+        pause_check=pause_check,
+    )
 
 
 def transcribe_video(
@@ -182,6 +150,7 @@ def transcribe_video(
         verbose=args.verbose,
         write_subtitle=not args.no_subtitle,
         subtitle_output_path=args.subtitle_output,
+        segment_length=args.segment_length,
     )
 
 

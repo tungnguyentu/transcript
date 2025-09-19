@@ -1,22 +1,25 @@
-"""FastAPI-based web UI for the transcript tool."""
+"""FastAPI-based web UI for the transcript tool with Celery background jobs."""
 
 from __future__ import annotations
 
 import html
-import pathlib
-import shutil
-import tempfile
-import threading
-import time
+import os
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Optional
 
+from celery import states
+from celery.result import AsyncResult
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-from .cli import transcribe_media
+from .tasks import (
+    SUBTITLE_ROOT,
+    UPLOAD_ROOT,
+    load_metadata,
+    transcribe_job,
+    write_metadata,
+)
 
 WHISPER_MODELS = [
     "tiny",
@@ -30,35 +33,20 @@ WHISPER_MODELS = [
 
 app = FastAPI(title="Transcript Tool Web UI")
 
-OUTPUT_DIR = pathlib.Path("output_subtitles")
 
-
-@dataclass
-class TaskState:
-    status: str
-    progress: int = 0
-    message: Optional[str] = None
-    model: str = "medium"
-    keep_source_language: bool = False
-    skip_subtitle: bool = False
-    paused: bool = False
-    subtitle_file: Optional[pathlib.Path] = None
-
-
-@dataclass
-class TaskControl:
-    pause_event: threading.Event = field(default_factory=threading.Event)
-    stop_event: threading.Event = field(default_factory=threading.Event)
-    progress_thread: Optional[threading.Thread] = field(default=None, init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        self.pause_event.set()
-
-
-TASKS: Dict[str, TaskState] = {}
-TASK_LOCK = threading.Lock()
-EXECUTOR = ThreadPoolExecutor(max_workers=2)
-TASK_CONTROLS: Dict[str, TaskControl] = {}
+def job_paths(task_id: str, original_filename: Optional[str] = None) -> dict[str, Path]:
+    job_dir = UPLOAD_ROOT / task_id
+    metadata_path = job_dir / "metadata.json"
+    upload_path = None
+    if original_filename is not None:
+        upload_path = job_dir / original_filename
+    subtitle_dir = SUBTITLE_ROOT / task_id
+    return {
+        "job_dir": job_dir,
+        "metadata_path": metadata_path,
+        "upload_path": upload_path,
+        "subtitle_dir": subtitle_dir,
+    }
 
 
 def _render_form(
@@ -75,7 +63,11 @@ def _render_form(
         ).replace("  ", " ")
         for model in WHISPER_MODELS
     )
-    message_block = f"<p class=\"message\" id=\"status-message\">{html.escape(message)}</p>" if message else "<p class=\"message\" id=\"status-message\"></p>"
+    message_block = (
+        f"<p class=\"message\" id=\"status-message\">{html.escape(message)}</p>"
+        if message
+        else "<p class=\"message\" id=\"status-message\"></p>"
+    )
     body = f"""
     <!DOCTYPE html>
     <html lang=\"en\">
@@ -89,7 +81,7 @@ def _render_form(
             label {{ display: block; font-weight: bold; margin-bottom: 0.25rem; }}
             input[type="file"] {{ padding: 0.5rem 0; }}
             .result {{ margin-top: 2rem; }}
-            .message {{ color: #d00; font-weight: bold; }}
+            .message {{ color: #d00; font-weight: bold; min-height: 1.2rem; }}
             progress {{ width: 100%; height: 1.5rem; }}
             .status-container {{ max-width: 28rem; margin-top: 1rem; }}
             .download-container {{ margin-top: 1rem; }}
@@ -321,144 +313,87 @@ async def index() -> HTMLResponse:
     return _render_form()
 
 
-def _update_task(task_id: str, **updates: object) -> None:
-    with TASK_LOCK:
-        state = TASKS.get(task_id)
-        if not state:
-            return
-        for key, value in updates.items():
-            setattr(state, key, value)
+def _status_from_celery(result: AsyncResult, meta: dict) -> dict:
+    celery_state = result.state
+    status = meta.get("status", "queued")
+    paused = status == "paused"
 
+    if celery_state == states.PENDING:
+        status = status or "queued"
+    elif celery_state in {states.STARTED, "PROGRESS", states.RECEIVED}:
+        if not paused:
+            status = "processing"
+    elif celery_state == states.SUCCESS:
+        status = "completed"
+    elif celery_state == states.FAILURE:
+        status = "error"
 
-def _get_task_and_control(task_id: str) -> tuple[TaskState, TaskControl]:
-    with TASK_LOCK:
-        state = TASKS.get(task_id)
-        control = TASK_CONTROLS.get(task_id)
-    if not state or not control:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return state, control
+    progress = int(meta.get("progress", 0))
+    message = meta.get("message", "")
+    if celery_state == states.FAILURE and result.info:
+        message = str(result.info)
 
+    subtitle_ready = bool(meta.get("subtitle_ready", False))
+    subtitle_filename = meta.get("subtitle_filename")
 
-def _task_payload(task_id: str, state: TaskState) -> dict[str, object]:
     return {
-        "task_id": task_id,
-        "status": state.status,
-        "progress": state.progress,
-        "message": state.message,
-        "model": state.model,
-        "keep_source_language": state.keep_source_language,
-        "skip_subtitle": state.skip_subtitle,
-        "paused": state.paused,
-        "subtitle_ready": state.subtitle_file is not None,
-        "subtitle_filename": state.subtitle_file.name if state.subtitle_file else None,
-        "subtitle_url": f"/api/download/{task_id}" if state.subtitle_file else None,
+        "status": status,
+        "progress": progress,
+        "message": message,
+        "paused": paused,
+        "subtitle_ready": subtitle_ready,
+        "subtitle_filename": subtitle_filename,
     }
 
 
-def _start_progress_simulation(task_id: str, control: TaskControl) -> None:
-    def _simulate() -> None:
-        while not control.stop_event.is_set():
-            control.pause_event.wait()
-            if control.stop_event.is_set():
-                break
-            with TASK_LOCK:
-                state = TASKS.get(task_id)
-            if not state:
-                break
-            if state.status != "processing" or state.paused:
-                time.sleep(0.5)
-                continue
-            next_progress = min(80, state.progress + 5 if state.progress < 80 else state.progress)
-            if next_progress > state.progress:
-                _update_task(task_id, progress=next_progress, message="Processing...")
-            time.sleep(2)
-
-    thread = threading.Thread(target=_simulate, daemon=True)
-    control.progress_thread = thread
-    thread.start()
-
-
-def _run_transcription_task(
-    *,
+def _build_payload(
     task_id: str,
-    input_path: pathlib.Path,
+    metadata_path: Path,
+    meta: dict,
+    file_path: Path,
+    subtitle_path: Optional[Path],
+    segment_length: int,
     model: str,
-    keep_source_language: bool,
-    skip_subtitle: bool,
-) -> None:
-    _, control = _get_task_and_control(task_id)
-
-    control.pause_event.wait()
-    _update_task(
-        task_id,
-        status="processing",
-        progress=10,
-        message="Processing transcription",
-        paused=False,
-    )
-    _start_progress_simulation(task_id, control)
-
-    try:
-        transcript_path, subtitle_path = transcribe_media(
-            input_path,
-            model=model,
-            keep_source_language=keep_source_language,
-            write_subtitle=not skip_subtitle,
-        )
-        control.pause_event.wait()
-        _update_task(task_id, progress=90, message="Finalizing outputs")
-
-        subtitle_file: Optional[pathlib.Path] = None
-        if subtitle_path:
-            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-            subtitle_file = OUTPUT_DIR / subtitle_path.name
-            shutil.copy2(subtitle_path, subtitle_file)
-
-        _update_task(
-            task_id,
-            status="completed",
-            progress=100,
-            message="Transcription complete",
-            paused=False,
-            subtitle_file=subtitle_file,
-        )
-    except Exception as exc:  # noqa: BLE001 - capture and expose to caller
-        _update_task(
-            task_id,
-            status="error",
-            progress=100,
-            message=str(exc),
-            paused=False,
-            subtitle_file=None,
-        )
-    finally:
-        control.stop_event.set()
-        try:
-            shutil.rmtree(input_path.parent, ignore_errors=True)
-        except OSError:
-            pass
+) -> dict:
+    return {
+        "task_id": task_id,
+        "metadata_path": str(metadata_path),
+        "input_path": str(file_path),
+        "model": model,
+        "keep_source_language": meta.get("keep_source_language", False),
+        "device": meta.get("device"),
+        "temperature": meta.get("temperature", 0.0),
+        "beam_size": meta.get("beam_size", 5),
+        "transcript_path": str(file_path.with_suffix(".txt")),
+        "subtitle_path": str(subtitle_path) if subtitle_path else None,
+        "segment_length": segment_length,
+    }
+def _segment_length() -> int:
+    return int(os.getenv("TRANSCRIPT_TOOL_SEGMENT_LENGTH", "60"))
 
 
-def _create_task_state(
-    *,
-    model: str,
-    keep_source_language: bool,
-    skip_subtitle: bool,
-) -> tuple[str, TaskState]:
-    task_id = uuid.uuid4().hex
-    state = TaskState(
-        status="queued",
-        progress=0,
-        message="Task queued",
-        model=model,
-        keep_source_language=keep_source_language,
-        skip_subtitle=skip_subtitle,
-    )
-    control = TaskControl()
-    with TASK_LOCK:
-        TASKS[task_id] = state
-        TASK_CONTROLS[task_id] = control
-    return task_id, state
+def _serialize_status(task_id: str, meta: dict) -> dict:
+    result = transcribe_job.AsyncResult(task_id)
+    status_payload = _status_from_celery(result, meta)
+    subtitle_ready = status_payload["subtitle_ready"]
+    subtitle_url = f"/api/download/{task_id}" if subtitle_ready else None
+
+    return {
+        "task_id": task_id,
+        **status_payload,
+        "subtitle_url": subtitle_url,
+        "model": meta.get("model"),
+        "keep_source_language": meta.get("keep_source_language", False),
+        "skip_subtitle": meta.get("skip_subtitle", False),
+    }
+
+
+def _load_meta_or_404(task_id: str) -> tuple[dict, Path]:
+    paths = job_paths(task_id)
+    meta = load_metadata(paths["metadata_path"])
+    if not meta:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return meta, paths["metadata_path"]
 
 
 @app.post("/api/transcribe")
@@ -470,91 +405,100 @@ async def queue_transcription(
 ) -> JSONResponse:
     if model not in WHISPER_MODELS:
         raise HTTPException(status_code=400, detail="Unknown model requested")
-
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing file name")
 
-    temp_dir = pathlib.Path(tempfile.mkdtemp(prefix="transcribe-tool-"))
-    safe_name = pathlib.Path(file.filename).name or "upload"
-    input_path = temp_dir / safe_name
+    task_id = uuid.uuid4().hex
+    paths = job_paths(task_id, file.filename)
+    paths["job_dir"].mkdir(parents=True, exist_ok=True)
 
-    with input_path.open("wb") as destination:
-        shutil.copyfileobj(file.file, destination)
+    upload_path = paths["upload_path"]
+    assert upload_path is not None
+    with upload_path.open("wb") as destination:
+        while True:
+            chunk = await file.read(1 << 20)
+            if not chunk:
+                break
+            destination.write(chunk)
 
-    file.file.close()
+    subtitle_path = None
+    if not skip_subtitle:
+        subtitle_dir = paths["subtitle_dir"]
+        subtitle_dir.mkdir(parents=True, exist_ok=True)
+        subtitle_path = subtitle_dir / Path(file.filename).with_suffix(".srt")
 
-    task_id, _state = _create_task_state(
-        model=model,
-        keep_source_language=keep_source_language,
-        skip_subtitle=skip_subtitle,
+    segment_length = _segment_length()
+
+    meta = {
+        "status": "queued",
+        "progress": 0,
+        "message": "Task queued",
+        "model": model,
+        "keep_source_language": bool(keep_source_language),
+        "skip_subtitle": bool(skip_subtitle),
+        "subtitle_ready": False,
+        "subtitle_filename": Path(file.filename).with_suffix(".srt").name if not skip_subtitle else None,
+        "original_filename": file.filename,
+        "device": None,
+        "temperature": 0.0,
+        "beam_size": 5,
+        "segment_length": segment_length,
+    }
+    write_metadata(paths["metadata_path"], meta)
+
+    payload = _build_payload(
+        task_id,
+        paths["metadata_path"],
+        meta,
+        upload_path,
+        subtitle_path,
+        segment_length,
+        model,
     )
 
-    EXECUTOR.submit(
-        _run_transcription_task,
-        task_id=task_id,
-        input_path=input_path,
-        model=model,
-        keep_source_language=keep_source_language,
-        skip_subtitle=skip_subtitle,
-    )
+    transcribe_job.apply_async(args=[payload], task_id=task_id)
 
     return JSONResponse({"task_id": task_id})
 
 
 @app.get("/api/status/{task_id}")
 async def get_status(task_id: str) -> JSONResponse:
-    with TASK_LOCK:
-        state = TASKS.get(task_id)
-    if not state:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    payload = _task_payload(task_id, state)
-
-    return JSONResponse(payload)
+    meta, _metadata_path = _load_meta_or_404(task_id)
+    response = _serialize_status(task_id, meta)
+    return JSONResponse(response)
 
 
 @app.post("/api/pause/{task_id}")
 async def pause_task(task_id: str) -> JSONResponse:
-    state, control = _get_task_and_control(task_id)
-    if state.status in {"completed", "error"}:
+    meta, metadata_path = _load_meta_or_404(task_id)
+    if meta.get("status") == "completed":
         raise HTTPException(status_code=400, detail="Task already finished")
-    control.pause_event.clear()
-    _update_task(
-        task_id,
-        status="paused",
-        message="Paused by user",
-        paused=True,
-    )
-    with TASK_LOCK:
-        refreshed_state = TASKS.get(task_id)
-    return JSONResponse(_task_payload(task_id, refreshed_state))
+    meta.update({"status": "paused", "message": "Paused by user"})
+    write_metadata(metadata_path, meta)
+    return JSONResponse(_serialize_status(task_id, meta))
 
 
 @app.post("/api/resume/{task_id}")
 async def resume_task(task_id: str) -> JSONResponse:
-    state, control = _get_task_and_control(task_id)
-    if state.status in {"completed", "error"}:
+    meta, metadata_path = _load_meta_or_404(task_id)
+    if meta.get("status") == "completed":
         raise HTTPException(status_code=400, detail="Task already finished")
-    control.pause_event.set()
-    _update_task(
-        task_id,
-        status="processing",
-        message="Resuming task",
-        paused=False,
-    )
-    with TASK_LOCK:
-        refreshed_state = TASKS.get(task_id)
-    return JSONResponse(_task_payload(task_id, refreshed_state))
+    meta.update({"status": "processing", "message": "Resuming task"})
+    write_metadata(metadata_path, meta)
+    return JSONResponse(_serialize_status(task_id, meta))
 
 
 @app.get("/api/download/{task_id}")
 async def download_subtitle(task_id: str) -> FileResponse:
-    state, _control = _get_task_and_control(task_id)
-    subtitle_file = state.subtitle_file
-    if not subtitle_file or not subtitle_file.exists():
+    meta, _metadata_path = _load_meta_or_404(task_id)
+    subtitle_path = meta.get("subtitle_path")
+    if not subtitle_path:
         raise HTTPException(status_code=404, detail="Subtitle not available")
+    path_obj = Path(subtitle_path)
+    if not path_obj.exists():
+        raise HTTPException(status_code=404, detail="Subtitle file missing")
     return FileResponse(
-        subtitle_file,
+        path_obj,
         media_type="text/plain",
-        filename=subtitle_file.name,
+        filename=meta.get("subtitle_filename", path_obj.name),
     )

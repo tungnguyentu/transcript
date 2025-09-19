@@ -135,4 +135,5 @@ Download the generated subtitle file.
 - Poll `/api/status/{task_id}` every 1–2 seconds until `status` is `completed` or `error`.
 - When `subtitle_ready` is `true`, enable a download control that hits `/api/download/{task_id}`.
 - For pause/resume toggles, call `/api/pause/{task_id}` and `/api/resume/{task_id}` based on the current `paused` flag.
-- Tasks remain available in memory until explicitly completed or paused/resumed. Completed tasks persist so downloads remain accessible; delete them from your client when no longer needed.
+- Tasks remain available in memory until the server process restarts. Completed tasks persist so downloads remain accessible; your client should clear stored `task_id` values once the subtitle is retrieved.
+- A Celery worker must be running (`python run.py worker --loglevel info`) with access to the shared `TRANSCRIPT_TOOL_WORK_DIR` so the web API can hand off uploads and pick up generated subtitles; configure broker/backends via `TRANSCRIPT_TOOL_BROKER_URL` and `TRANSCRIPT_TOOL_RESULT_BACKEND`.

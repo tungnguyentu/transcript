@@ -1,6 +1,6 @@
 import textwrap
 
-from transcript_tool.cli import format_timestamp, segments_to_srt
+from transcript_tool.utils import format_timestamp, segments_to_srt
 
 
 def test_format_timestamp_zero():
